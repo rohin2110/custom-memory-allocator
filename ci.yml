@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.compiler }} / ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libgtest-dev
+
+      - name: Pick the compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            echo "CC=clang"    >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          else
+            echo "CC=gcc"  >> "$GITHUB_ENV"
+            echo "CXX=g++" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure
+        # WERROR makes -Wall -Wextra -Wpedantic fatal. That is the point of
+        # running this in CI instead of trusting a local build where a warning
+        # scrolls past unnoticed.
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DMYALLOC_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 600
+
+      - name: Run the workloads
+        # The CLI exits non-zero if its heap check ever fails, so these are
+        # real tests against bigger workloads than the unit tests use.
+        run: |
+          ./build/myalloc_cli small 200000
+          ./build/myalloc_cli mixed 200000
+          ./build/myalloc_cli frag  20000
+          ./build/myalloc_cli paging
+
+  ubsan:
+    name: UBSan
+    runs-on: ubuntu-latest
+    # There is no AddressSanitizer job on purpose. ASan replaces malloc and
+    # cannot see inside a custom allocator, so it would find nothing here — the
+    # heap checker does that job. UBSan checks alignment and integer overflow,
+    # which don't depend on knowing where the heap is, so it genuinely helps.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libgtest-dev
+
+      - name: Configure with UBSan
+        run: >
+          cmake -S . -B build-ubsan -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DMYALLOC_ENABLE_UBSAN=ON
+          -DMYALLOC_WERROR=ON
+
+      - name: Build
+        run: cmake --build build-ubsan --parallel
+
+      - name: Test
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-ubsan --output-on-failure --timeout 900
+
+      - name: Workloads
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ./build-ubsan/myalloc_cli mixed 50000
+          ./build-ubsan/myalloc_cli frag  5000
+          ./build-ubsan/myalloc_cli paging
